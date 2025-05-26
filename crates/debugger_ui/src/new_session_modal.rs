@@ -1,16 +1,16 @@
 use collections::FxHashMap;
+use language::LanguageRegistry;
 use std::{
     borrow::Cow,
     ops::Not,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
     usize,
 };
 
-use anyhow::Result;
 use dap::{
-    DapRegistry, DebugRequest,
-    adapters::{DebugAdapterName, DebugTaskDefinition},
+    DapRegistry, DebugRequest, TelemetrySpawnLocation, adapters::DebugAdapterName, send_telemetry,
 };
 use editor::{Editor, EditorElement, EditorStyle};
 use fuzzy::{StringMatch, StringMatchCandidate};
@@ -21,7 +21,7 @@ use gpui::{
 use picker::{Picker, PickerDelegate, highlighted_match_with_paths::HighlightedMatch};
 use project::{ProjectPath, TaskContexts, TaskSourceKind, task_store::TaskStore};
 use settings::Settings;
-use task::{DebugScenario, LaunchRequest};
+use task::{DebugScenario, LaunchRequest, ZedDebugConfig};
 use theme::ThemeSettings;
 use ui::{
     ActiveTheme, Button, ButtonCommon, ButtonSize, CheckboxWithLabel, Clickable, Color, Context,
@@ -81,6 +81,7 @@ impl NewSessionModal {
             return;
         };
         let task_store = workspace.project().read(cx).task_store().clone();
+        let languages = workspace.app_state().languages.clone();
 
         cx.spawn_in(window, async move |workspace, cx| {
             workspace.update_in(cx, |workspace, window, cx| {
@@ -128,12 +129,17 @@ impl NewSessionModal {
                                     this.custom_mode.update(cx, |custom, cx| {
                                         custom.load(active_cwd, window, cx);
                                     });
+
+                                    this.debugger = None;
                                 }
 
                                 this.launch_picker.update(cx, |picker, cx| {
-                                    picker
-                                        .delegate
-                                        .task_contexts_loaded(task_contexts, window, cx);
+                                    picker.delegate.task_contexts_loaded(
+                                        task_contexts,
+                                        languages,
+                                        window,
+                                        cx,
+                                    );
                                     picker.refresh(window, cx);
                                     cx.notify();
                                 });
@@ -203,15 +209,16 @@ impl NewSessionModal {
             None
         };
 
-        Some(DebugScenario {
+        let session_scenario = ZedDebugConfig {
             adapter: debugger.to_owned().into(),
             label,
-            request: Some(request),
-            initialize_args: None,
-            tcp_connection: None,
+            request: request,
             stop_on_entry,
-            build: None,
-        })
+        };
+
+        cx.global::<DapRegistry>()
+            .adapter(&session_scenario.adapter)
+            .and_then(|adapter| adapter.config_from_zed_format(session_scenario).ok())
     }
 
     fn start_new_session(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -235,6 +242,7 @@ impl NewSessionModal {
         let Some(task_contexts) = self.task_contexts(cx) else {
             return;
         };
+        send_telemetry(&config, TelemetrySpawnLocation::Custom, cx);
         let task_context = task_contexts.active_context().cloned().unwrap_or_default();
         let worktree_id = task_contexts.worktree();
         cx.spawn_in(window, async move |this, cx| {
@@ -245,7 +253,7 @@ impl NewSessionModal {
                 cx.emit(DismissEvent);
             })
             .ok();
-            Result::<_, anyhow::Error>::Ok(())
+            anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
@@ -257,12 +265,12 @@ impl NewSessionModal {
         cx: &mut App,
     ) {
         attach.update(cx, |this, cx| {
-            if adapter != &this.definition.adapter {
-                this.definition.adapter = adapter.clone();
+            if adapter.0 != this.definition.adapter {
+                this.definition.adapter = adapter.0.clone();
 
                 this.attach_picker.update(cx, |this, cx| {
                     this.picker.update(cx, |this, cx| {
-                        this.delegate.definition.adapter = adapter.clone();
+                        this.delegate.definition.adapter = adapter.0.clone();
                         this.focus(window, cx);
                     })
                 });
@@ -272,8 +280,8 @@ impl NewSessionModal {
         })
     }
 
-    fn task_contexts<'a>(&self, cx: &'a mut Context<Self>) -> Option<&'a TaskContexts> {
-        self.launch_picker.read(cx).delegate.task_contexts.as_ref()
+    fn task_contexts(&self, cx: &App) -> Option<Arc<TaskContexts>> {
+        self.launch_picker.read(cx).delegate.task_contexts.clone()
     }
 
     fn adapter_drop_down_menu(
@@ -742,7 +750,10 @@ impl CustomMode {
 
         let program = cx.new(|cx| Editor::single_line(window, cx));
         program.update(cx, |this, cx| {
-            this.set_placeholder_text("Run", cx);
+            this.set_placeholder_text(
+                "ALPHA=\"Windows\" BETA=\"Wen\" your_program --arg1 --arg2=arg3",
+                cx,
+            );
 
             if let Some(past_program) = past_program {
                 this.set_text(past_program, window, cx);
@@ -794,34 +805,6 @@ impl CustomMode {
         } else {
             env = FxHashMap::default();
             command
-        };
-
-        let program = if let Some(program) = program.strip_prefix('~') {
-            format!(
-                "$ZED_WORKTREE_ROOT{}{}",
-                std::path::MAIN_SEPARATOR,
-                &program
-            )
-        } else if !program.starts_with(std::path::MAIN_SEPARATOR) {
-            format!(
-                "$ZED_WORKTREE_ROOT{}{}",
-                std::path::MAIN_SEPARATOR,
-                &program
-            )
-        } else {
-            program
-        };
-
-        let path = if path.starts_with('~') && !path.is_empty() {
-            format!(
-                "$ZED_WORKTREE_ROOT{}{}",
-                std::path::MAIN_SEPARATOR,
-                &path[1..]
-            )
-        } else if !path.starts_with(std::path::MAIN_SEPARATOR) && !path.is_empty() {
-            format!("$ZED_WORKTREE_ROOT{}{}", std::path::MAIN_SEPARATOR, &path)
-        } else {
-            path
         };
 
         let args = args.collect::<Vec<_>>();
@@ -881,7 +864,7 @@ impl CustomMode {
 
 #[derive(Clone)]
 pub(super) struct AttachMode {
-    pub(super) definition: DebugTaskDefinition,
+    pub(super) definition: ZedDebugConfig,
     pub(super) attach_picker: Entity<AttachModal>,
 }
 
@@ -892,12 +875,10 @@ impl AttachMode {
         window: &mut Window,
         cx: &mut Context<NewSessionModal>,
     ) -> Entity<Self> {
-        let definition = DebugTaskDefinition {
-            adapter: debugger.unwrap_or(DebugAdapterName("".into())),
+        let definition = ZedDebugConfig {
+            adapter: debugger.unwrap_or(DebugAdapterName("".into())).0,
             label: "Attach New Session Setup".into(),
             request: dap::DebugRequest::Attach(task::AttachRequest { process_id: None }),
-            initialize_args: None,
-            tcp_connection: None,
             stop_on_entry: Some(false),
         };
         let attach_picker = cx.new(|cx| {
@@ -924,7 +905,7 @@ pub(super) struct DebugScenarioDelegate {
     matches: Vec<StringMatch>,
     prompt: String,
     debug_panel: WeakEntity<DebugPanel>,
-    task_contexts: Option<TaskContexts>,
+    task_contexts: Option<Arc<TaskContexts>>,
     divider_index: Option<usize>,
     last_used_candidate_index: Option<usize>,
 }
@@ -944,13 +925,40 @@ impl DebugScenarioDelegate {
         }
     }
 
+    fn get_scenario_kind(
+        languages: &Arc<LanguageRegistry>,
+        dap_registry: &DapRegistry,
+        scenario: DebugScenario,
+    ) -> (Option<TaskSourceKind>, DebugScenario) {
+        let language_names = languages.language_names();
+        let language = dap_registry
+            .adapter_language(&scenario.adapter)
+            .map(|language| TaskSourceKind::Language {
+                name: language.into(),
+            });
+
+        let language = language.or_else(|| {
+            scenario.label.split_whitespace().find_map(|word| {
+                language_names
+                    .iter()
+                    .find(|name| name.eq_ignore_ascii_case(word))
+                    .map(|name| TaskSourceKind::Language {
+                        name: name.to_owned().into(),
+                    })
+            })
+        });
+
+        (language, scenario)
+    }
+
     pub fn task_contexts_loaded(
         &mut self,
         task_contexts: TaskContexts,
+        languages: Arc<LanguageRegistry>,
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        self.task_contexts = Some(task_contexts);
+        self.task_contexts = Some(Arc::new(task_contexts));
 
         let (recent, scenarios) = self
             .task_store
@@ -967,14 +975,16 @@ impl DebugScenarioDelegate {
             self.last_used_candidate_index = Some(recent.len() - 1);
         }
 
+        let dap_registry = cx.global::<DapRegistry>();
+
         self.candidates = recent
             .into_iter()
-            .map(|scenario| (None, scenario))
-            .chain(
-                scenarios
-                    .into_iter()
-                    .map(|(kind, scenario)| (Some(kind), scenario)),
-            )
+            .map(|scenario| Self::get_scenario_kind(&languages, &dap_registry, scenario))
+            .chain(scenarios.into_iter().map(|(kind, scenario)| {
+                let (language, scenario) =
+                    Self::get_scenario_kind(&languages, &dap_registry, scenario);
+                (language.or(Some(kind)), scenario)
+            }))
             .collect();
     }
 }
@@ -1084,6 +1094,7 @@ impl PickerDelegate for DebugScenarioDelegate {
             })
             .unwrap_or_default();
 
+        send_telemetry(&debug_scenario, TelemetrySpawnLocation::ScenarioList, cx);
         self.debug_panel
             .update(cx, |panel, cx| {
                 panel.start_session(debug_scenario, task_context, None, worktree_id, window, cx);
@@ -1115,7 +1126,7 @@ impl PickerDelegate for DebugScenarioDelegate {
         let task_kind = &self.candidates[hit.candidate_id].0;
 
         let icon = match task_kind {
-            Some(TaskSourceKind::Lsp(..)) => Some(Icon::new(IconName::Bolt)),
+            Some(TaskSourceKind::Lsp(..)) => Some(Icon::new(IconName::BoltFilled)),
             Some(TaskSourceKind::UserInput) => Some(Icon::new(IconName::Terminal)),
             Some(TaskSourceKind::AbsPath { .. }) => Some(Icon::new(IconName::Settings)),
             Some(TaskSourceKind::Worktree { .. }) => Some(Icon::new(IconName::FileTree)),
@@ -1134,5 +1145,44 @@ impl PickerDelegate for DebugScenarioDelegate {
                 .toggle_state(selected)
                 .child(highlighted_location.render(window, cx)),
         )
+    }
+}
+
+pub(crate) fn resolve_path(path: &mut String) {
+    if path.starts_with('~') {
+        let home = paths::home_dir().to_string_lossy().to_string();
+        let trimmed_path = path.trim().to_owned();
+        *path = trimmed_path.replacen('~', &home, 1);
+    } else if let Some(strip_path) = path.strip_prefix(&format!(".{}", std::path::MAIN_SEPARATOR)) {
+        *path = format!(
+            "$ZED_WORKTREE_ROOT{}{}",
+            std::path::MAIN_SEPARATOR,
+            &strip_path
+        );
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use paths::home_dir;
+
+    #[test]
+    fn test_normalize_paths() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let home = home_dir().to_string_lossy().to_string();
+        let resolve_path = |path: &str| -> String {
+            let mut path = path.to_string();
+            super::resolve_path(&mut path);
+            path
+        };
+
+        assert_eq!(resolve_path("bin"), format!("bin"));
+        assert_eq!(resolve_path(&format!("{sep}foo")), format!("{sep}foo"));
+        assert_eq!(resolve_path(""), format!(""));
+        assert_eq!(
+            resolve_path(&format!("~{sep}blah")),
+            format!("{home}{sep}blah")
+        );
+        assert_eq!(resolve_path("~"), home);
     }
 }
